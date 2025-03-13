@@ -15,6 +15,7 @@ if (!IMAGE_DIR) {
 }
 
 const EXCLUSION_FILE = path.join(IMAGE_DIR, "exclusion.txt");
+const MIN_FILE_SIZE = 64 * 1024; // 64KB
 
 // Enable CORS for frontend requests
 app.use(require("cors")());
@@ -22,7 +23,7 @@ app.use(require("cors")());
 // Serve images statically
 app.use("/images", express.static(IMAGE_DIR));
 
-// Function to read exclusion list
+// Function to read exclusion list (IDs)
 function getExclusionList() {
     try {
         if (fs.existsSync(EXCLUSION_FILE)) {
@@ -30,7 +31,7 @@ function getExclusionList() {
                 fs.readFileSync(EXCLUSION_FILE, "utf-8")
                     .split("\n")
                     .map(line => line.trim())
-                    .filter(line => line.length > 0) // Remove empty lines
+                    .filter(line => /^\d+$/.test(line)) // Only allow numeric IDs
             );
         }
     } catch (err) {
@@ -39,10 +40,10 @@ function getExclusionList() {
     return new Set();
 }
 
-// Function to extract numeric ID from filename
+// Function to extract the full numeric ID from filename (before .png)
 function extractNumericID(filename) {
-    const match = filename.match(/\d+/); // Extract first number found in the filename
-    return match ? parseInt(match[0], 10) : Infinity; // Default to a high value if no number
+    const match = filename.match(/^(\d+)\.png$/); // Match full number before ".png"
+    return match ? match[1] : null; // Keep as string for exact comparison
 }
 
 // API to get the list of PNG files, sorted numerically by ID
@@ -54,12 +55,20 @@ app.get("/list-images", (req, res) => {
             return res.status(500).json({ error: "Error reading directory" });
         }
 
-        // Filter and sort files
+        // Filter, check file size, and sort files
         const pngFiles = files
             .filter(file => file.endsWith(".png"))
-            .map(file => ({ file, id: extractNumericID(file) })) // Extract numeric IDs
-            .filter(({ file }) => !exclusionList.has(path.parse(file).name)) // Apply exclusion
-            .sort((a, b) => a.id - b.id) // Sort numerically
+            .map(file => ({
+                file,
+                id: extractNumericID(file),
+                size: fs.statSync(path.join(IMAGE_DIR, file)).size
+            }))
+            .filter(({ id, size }) => 
+                id !== null &&
+                !exclusionList.has(id) && // Exact ID match
+                size > MIN_FILE_SIZE
+            )
+            .sort((a, b) => parseInt(a.id, 10) - parseInt(b.id, 10)) // Sort numerically
             .map(({ file }) => file); // Return only filenames
 
         res.json(pngFiles);
