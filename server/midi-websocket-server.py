@@ -50,6 +50,7 @@ async def select_midi_device(request):
     global selected_midi_device
     data = await request.json()
     device_name = data.get("device")
+    print(mido.get_input_names())
 
     if device_name not in mido.get_input_names():
         return web.json_response({"error": "Device not found"}, status=400)

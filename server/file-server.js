@@ -15,7 +15,7 @@ if (!IMAGE_DIR) {
 }
 
 const EXCLUSION_FILE = path.join(IMAGE_DIR, "exclusion.txt");
-const MIN_FILE_SIZE = 64 * 1024; // 64KB
+const MIN_FILE_SIZE = 2 *64 * 1024; // 64KB
 
 // Enable CORS for frontend requests
 app.use(require("cors")());
