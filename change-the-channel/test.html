@@ -1,0 +1,404 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>PNG Viewer with Centered Image, Scanner, Speed & Blend Transition</title>
+  <style>
+    body { 
+      margin: 0; 
+      overflow: hidden; 
+      background: black; 
+      display: flex; 
+      align-items: center; 
+      justify-content: center; 
+    }
+    canvas { display: block; }
+  </style>
+</head>
+<body>
+  <canvas id="glCanvas"></canvas>
+  <script>
+    // Global variables
+    let imageList = [];
+    let currentIndex = 0;
+    let gl, canvas, shaderProgram;
+    // Image's original dimensions.
+    let imageWidth = 0, imageHeight = 0;
+    // Scanner: vertical position (in pixels) of the scan line relative to the image.
+    let scannerRow = 0;
+    let unchangedCount = 0;
+    // Horizontal offset for sliding (normalized 0 to 1).
+    let offset = 0;
+    // Control flags and speeds:
+    let scrollActive = false; // off by default
+    let scrollSpeed = 0.002;
+    let scanSpeed = 3; // vertical scanning speed (pixels per frame)
+    let autoTimer;
+
+    // For blend transition between images:
+    let currentTexture = null;
+    let prevTexture = null;
+    let blendFactor = 1.0; // 1.0 means fully new image shown.
+    let transitioning = false;
+    const transitionDuration = 47; // duration in ms
+    let transitionStartTime = 0;
+
+    // We'll use a transformation matrix to center the image on the full-window canvas.
+    // u_transform will be a 4x4 matrix that scales the full-screen quad (which covers clip space [-1,1])
+    // to a rectangle whose size is based on imageWidth/canvas.width and imageHeight/canvas.height.
+    let transformMatrix = new Float32Array(16);
+
+    // Configuration: default sequential order.
+    const config = { randomOrder: false };
+
+    async function fetchImages() {
+      const response = await fetch("http://localhost:3001/list-images");
+      imageList = await response.json();
+      if (config.randomOrder) { shuffleArray(imageList); }
+      loadNextImage();
+      startAutoTimer();
+      setInterval(updateScannerEffect, 16);
+      window.addEventListener("resize", onWindowResize);
+    }
+
+    function onWindowResize() {
+      // Always fill the window.
+      canvas.width = window.innerWidth;
+      canvas.height = window.innerHeight;
+      updateTransform();
+      drawScene();
+    }
+
+    function startAutoTimer() {
+      clearTimeout(autoTimer);
+      autoTimer = setTimeout(() => {
+        currentIndex = (currentIndex + 1) % imageList.length;
+        loadNextImage();
+        startAutoTimer();
+      }, 59000);
+    }
+
+    function loadNextImage() {
+      if (imageList.length === 0) return;
+      loadTexture(`http://localhost:3001/images/${imageList[currentIndex]}`);
+    }
+
+    function shuffleArray(array) {
+      for (let i = array.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [array[i], array[j]] = [array[j], array[i]];
+      }
+    }
+
+    function initWebGL() {
+      canvas = document.getElementById("glCanvas");
+      // Always fill the window.
+      canvas.width = window.innerWidth;
+      canvas.height = window.innerHeight;
+      gl = canvas.getContext("webgl");
+      if (!gl) {
+        console.error("WebGL not supported");
+        return;
+      }
+      // Vertex shader uses a transformation matrix (u_transform) to center the image.
+      const vertexShaderSource = `
+        attribute vec4 a_position;
+        attribute vec2 a_texCoord;
+        uniform mat4 u_transform;
+        varying vec2 v_texCoord;
+        void main() {
+          gl_Position = u_transform * a_position;
+          v_texCoord = a_texCoord;
+        }
+      `;
+      // Fragment shader now blends the previous and current images.
+      // It applies the same scanner effect and horizontal offset to both textures.
+      const fragmentShaderSource = `
+        precision mediump float;
+        varying vec2 v_texCoord;
+        uniform sampler2D u_texture;
+        uniform sampler2D u_prevTexture;
+        uniform float u_scanLine;
+        uniform float u_offset;
+        uniform float u_blend;
+        void main() {
+          // Compute shifted texture coordinates.
+          vec2 shiftedTexCoord = vec2(mod(v_texCoord.x + u_offset, 1.0), v_texCoord.y);
+          // New image sample.
+          vec4 newPixel = texture2D(u_texture, shiftedTexCoord);
+          vec4 newOutput;
+          float scanY = u_scanLine;
+          if (v_texCoord.y > scanY) {
+            newOutput = newPixel;
+          } else {
+            vec2 copiedTexCoord = vec2(mod(v_texCoord.x + u_offset, 1.0), scanY);
+            newOutput = texture2D(u_texture, copiedTexCoord);
+          }
+          // Previous image sample.
+          vec4 oldPixel = texture2D(u_prevTexture, shiftedTexCoord);
+          vec4 oldOutput;
+          if (v_texCoord.y > scanY) {
+            oldOutput = oldPixel;
+          } else {
+            vec2 copiedTexCoordOld = vec2(mod(v_texCoord.x + u_offset, 1.0), scanY);
+            oldOutput = texture2D(u_prevTexture, copiedTexCoordOld);
+          }
+          // Mix the outputs based on the blend factor.
+          gl_FragColor = mix(oldOutput, newOutput, u_blend);
+        }
+      `;
+      const vertexShader = createShader(gl, gl.VERTEX_SHADER, vertexShaderSource);
+      const fragmentShader = createShader(gl, gl.FRAGMENT_SHADER, fragmentShaderSource);
+      shaderProgram = createProgram(gl, vertexShader, fragmentShader);
+      gl.useProgram(shaderProgram);
+
+      // Cache uniform locations in the shader program.
+      shaderProgram.u_transform = gl.getUniformLocation(shaderProgram, "u_transform");
+      shaderProgram.u_scanLine = gl.getUniformLocation(shaderProgram, "u_scanLine");
+      shaderProgram.u_offset    = gl.getUniformLocation(shaderProgram, "u_offset");
+      shaderProgram.u_blend     = gl.getUniformLocation(shaderProgram, "u_blend");
+      shaderProgram.u_texture   = gl.getUniformLocation(shaderProgram, "u_texture");
+      shaderProgram.u_prevTexture = gl.getUniformLocation(shaderProgram, "u_prevTexture");
+
+      setupBuffers();
+      updateTransform();
+    }
+
+    function setupBuffers() {
+      // Create a full-screen quad in clip space.
+      const positionBuffer = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+      // Our base quad covers clip space [-1,1] in both axes.
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+         -1, -1,   1, -1,   -1,  1,
+         -1,  1,   1, -1,    1,  1,
+      ]), gl.STATIC_DRAW);
+      const texCoordBuffer = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, texCoordBuffer);
+      // Texture coordinates cover [0,1].
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+         0, 1,   1, 1,   0, 0,
+         0, 0,   1, 1,   1, 0,
+      ]), gl.STATIC_DRAW);
+      const posLoc = gl.getAttribLocation(shaderProgram, "a_position");
+      gl.enableVertexAttribArray(posLoc);
+      gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+      gl.vertexAttribPointer(posLoc, 2, gl.FLOAT, false, 0, 0);
+      const texLoc = gl.getAttribLocation(shaderProgram, "a_texCoord");
+      gl.enableVertexAttribArray(texLoc);
+      gl.bindBuffer(gl.ARRAY_BUFFER, texCoordBuffer);
+      gl.vertexAttribPointer(texLoc, 2, gl.FLOAT, false, 0, 0);
+      // Create the initial texture (will be used as currentTexture).
+      currentTexture = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, currentTexture);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    }
+
+    function createShader(gl, type, source) {
+      const shader = gl.createShader(type);
+      gl.shaderSource(shader, source);
+      gl.compileShader(shader);
+      if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+        console.error("Shader compilation failed:", gl.getShaderInfoLog(shader));
+        gl.deleteShader(shader);
+        return null;
+      }
+      return shader;
+    }
+
+    function createProgram(gl, vertexShader, fragmentShader) {
+      const program = gl.createProgram();
+      gl.attachShader(program, vertexShader);
+      gl.attachShader(program, fragmentShader);
+      gl.linkProgram(program);
+      if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+        console.error("Program linking failed:", gl.getProgramInfoLog(program));
+        return null;
+      }
+      return program;
+    }
+
+    // Loads a new image, starts a blend transition from the previous image.
+    function loadTexture(imageUrl) {
+      const img = new Image();
+      img.crossOrigin = "anonymous";
+      img.onload = function () {
+        // Before loading a new image, if we already have a current texture, save it.
+        if (currentTexture) {
+          prevTexture = currentTexture;
+          // Start the blend transition.
+          transitioning = true;
+          transitionStartTime = performance.now();
+          blendFactor = 0.0;
+        } else {
+          blendFactor = 1.0;
+        }
+        // Save image dimensions and preserve relative scannerRow position.
+        let normalized = (imageHeight > 0) ? (scannerRow / imageHeight) : 0.63;
+        imageWidth = img.width;
+        imageHeight = img.height;
+        scannerRow = Math.floor(normalized * imageHeight);
+        updateTransform();
+
+        // Create a new texture for the new image.
+        const newTex = gl.createTexture();
+        gl.bindTexture(gl.TEXTURE_2D, newTex);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
+        gl.generateMipmap(gl.TEXTURE_2D);
+        currentTexture = newTex;
+
+        drawScene();
+      };
+      img.src = imageUrl;
+    }
+
+    // Update the scanner effect, horizontal offset and blend transition.
+    function updateScannerEffect() {
+      // If a blend transition is in progress, update the blend factor.
+      if (transitioning) {
+        let elapsed = performance.now() - transitionStartTime;
+        blendFactor = Math.min(elapsed / transitionDuration, 1.0);
+        if (blendFactor >= 1.0) {
+          transitioning = false;
+        }
+      }
+      // Update the scan line uniform.
+      let normalizedScanRow = scannerRow / imageHeight;
+      gl.uniform1f(shaderProgram.u_scanLine, normalizedScanRow);
+      
+      // Update horizontal offset if scrolling is active.
+      if (scrollActive) {
+        offset += scrollSpeed;
+        if (offset >= 1.0) { offset -= 1.0; }
+      }
+      gl.uniform1f(shaderProgram.u_offset, offset);
+      
+      // Scanner row change logic.
+      if (scannerRow > 0 && scannerRow < imageHeight) {
+        let rowCurrent = new Uint8Array(canvas.width * 4);
+        let rowPrevious = new Uint8Array(canvas.width * 4);
+        gl.readPixels(0, scannerRow, canvas.width, 1, gl.RGBA, gl.UNSIGNED_BYTE, rowCurrent);
+        gl.readPixels(0, scannerRow - 1, canvas.width, 1, gl.RGBA, gl.UNSIGNED_BYTE, rowPrevious);
+        let unchanged = true;
+        for (let i = 0; i < rowCurrent.length; i++) {
+          if (rowCurrent[i] !== rowPrevious[i]) { unchanged = false; break; }
+        }
+        if (unchanged) { unchangedCount++; } else { unchangedCount = 0; }
+      }
+      if (unchangedCount >= 3) {
+        scannerRow += 1;
+        unchangedCount = 0;
+      } else {
+        scannerRow += scanSpeed;
+      }
+      if (scannerRow >= imageHeight) {
+        // Wrap-around: continue scanning from 63% of image height.
+        scannerRow = Math.floor(imageHeight * 0.63);
+      }
+      drawScene();
+    }
+
+    // Compute and update the transformation matrix so that the image is drawn at its original size,
+    // centered on the full-window canvas.
+    function updateTransform() {
+      const transformLoc = shaderProgram.u_transform;
+      let cw = canvas.width;
+      let ch = canvas.height;
+      // Scale factors: image's size relative to canvas.
+      let scaleX = imageWidth / cw;
+      let scaleY = imageHeight / ch;
+      // Create a scale matrix that maps a full-screen quad [-1,1] to a rectangle of size (scaleX*2, scaleY*2).
+      let m = new Float32Array([
+         scaleX,    0,    0, 0,
+             0, scaleY,    0, 0,
+             0,    0,    1, 0,
+             0,    0,    0, 1
+      ]);
+      gl.uniformMatrix4fv(transformLoc, false, m);
+    }
+
+    function drawScene() {
+      gl.clear(gl.COLOR_BUFFER_BIT);
+      gl.viewport(0, 0, canvas.width, canvas.height);
+      
+      // Bind the current image texture to texture unit 0.
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, currentTexture);
+      gl.uniform1i(shaderProgram.u_texture, 0);
+      
+      // Bind the previous image texture (or current if none) to texture unit 1.
+      gl.activeTexture(gl.TEXTURE1);
+      gl.bindTexture(gl.TEXTURE_2D, prevTexture ? prevTexture : currentTexture);
+      gl.uniform1i(shaderProgram.u_prevTexture, 1);
+      
+      // Set the blend factor uniform.
+      gl.uniform1f(shaderProgram.u_blend, blendFactor);
+      
+      gl.drawArrays(gl.TRIANGLES, 0, 6);
+    }
+
+    window.addEventListener("keydown", function (e) {
+      switch(e.code) {
+        case "ArrowLeft":
+          e.preventDefault();
+          if (e.shiftKey) {
+            currentIndex = Math.max(0, currentIndex - 100);
+          } else {
+            currentIndex = (currentIndex - 1 + imageList.length) % imageList.length;
+          }
+          loadNextImage();
+          startAutoTimer();
+          break;
+        case "ArrowRight":
+          e.preventDefault();
+          if (e.shiftKey) {
+            currentIndex = Math.min(imageList.length - 1, currentIndex + 100);
+          } else {
+            currentIndex = (currentIndex + 1) % imageList.length;
+          }
+          loadNextImage();
+          startAutoTimer();
+          break;
+        case "Space":
+          e.preventDefault();
+          // Toggle horizontal scrolling.
+          scrollActive = !scrollActive;
+          break;
+        case "KeyQ":
+          // Decrease vertical scan speed.
+          scanSpeed = Math.max(0.2, scanSpeed - 0.2);
+          break;
+        case "KeyW":
+          // Increase vertical scan speed.
+          scanSpeed += 0.2;
+          break;
+        case "KeyA":
+          // Decrease horizontal scroll speed.
+          scrollSpeed = Math.max(0.0005, scrollSpeed - 0.0005);
+          break;
+        case "KeyS":
+          // Increase horizontal scroll speed.
+          scrollSpeed += 0.0005;
+          break;
+        case "KeyZ":
+          // Restart scanning: set scannerRow so that scanning starts at the top.
+          scannerRow = imageHeight;
+          break;
+      }
+    });
+
+    window.onload = function () {
+      initWebGL();
+      fetchImages();
+    };
+  </script>
+</body>
+</html>
