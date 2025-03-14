@@ -121,3 +121,4 @@ app.on_startup.append(on_startup)
 if __name__ == '__main__':
     print("🚀 Server running on port 8080...")
     web.run_app(app, port=8080)
+    

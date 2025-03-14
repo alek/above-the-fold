@@ -1,1 +1,7 @@
 npm install express cors
+pip3 install mido aiohttp aiohttp_cors rtmidi
+
+alt
+
+brew install rtmidi
+pip install python-rtmidi
