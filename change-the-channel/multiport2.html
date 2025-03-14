@@ -1,0 +1,429 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>PNG Viewer with 2x3 Tiled Canvases & Scanner/Scroll Controls</title>
+  <style>
+    /* Remove default margin; let canvases extend as needed */
+    body {
+      margin: 0;
+      background: black;
+      /* allow overflow so bottom canvases can fall off-screen if needed */
+      overflow: visible;
+    }
+    /* The container always uses a 2-column x 3-row grid. 
+       Each cell is forced to be exactly half the viewport width in both dimensions,
+       so horizontally there are no gaps. Vertically the grid’s height is 3*(100vw/2),
+       which may be taller than the viewport. */
+    #canvasContainer {
+      width: 100vw;
+      /* We don’t force container height to 100vh.
+         Instead, each row’s height is set to calc(100vw / 2). */
+      display: grid;
+      gap: 0;
+      grid-template-columns: repeat(2, 1fr);
+      grid-template-rows: repeat(3, calc(100vw / 2));
+    }
+    /* Each canvas fills its grid cell completely */
+    canvas {
+      width: 100%;
+      height: 100%;
+      display: block;
+    }
+  </style>
+</head>
+<body>
+  <!-- Container for canvases -->
+  <div id="canvasContainer"></div>
+  <script>
+    // ----- Global shared state -----
+    let state = {
+      imageWidth: 0,
+      imageHeight: 0,
+      scannerRow: 0,
+      offset: 0,
+      unchangedCount: 0,
+      scrollActive: false,
+      scrollSpeed: 0.002,
+      scanSpeed: 3, // pixels per frame
+    };
+    let imageList = [];
+    let currentIndex = 0;
+    const config = { randomOrder: false };
+    let canvasInstances = [];
+    let autoTimer;
+
+    // ----- CanvasInstance Class -----
+    function CanvasInstance(canvas) {
+      this.canvas = canvas;
+      this.gl = canvas.getContext("webgl");
+      if (!this.gl) {
+        console.error("WebGL not supported in one of the canvases");
+        return;
+      }
+      this.shaderProgram = null;
+      this.texture = null;
+      this.init();
+    }
+
+    CanvasInstance.prototype.init = function() {
+      const gl = this.gl;
+      // Set the drawing buffer size to match the CSS size.
+      this.updateCanvasSize();
+      // Vertex shader: applies a transformation matrix to position & scale the image.
+      const vertexShaderSource = `
+        attribute vec4 a_position;
+        attribute vec2 a_texCoord;
+        uniform mat4 u_transform;
+        varying vec2 v_texCoord;
+        void main() {
+          gl_Position = u_transform * a_position;
+          v_texCoord = a_texCoord;
+        }
+      `;
+      // Fragment shader: applies horizontal scrolling and vertical scanning.
+      const fragmentShaderSource = `
+        precision mediump float;
+        varying vec2 v_texCoord;
+        uniform sampler2D u_texture;
+        uniform float u_scanLine;
+        uniform float u_offset;
+        void main() {
+          vec2 shiftedTexCoord = vec2(mod(v_texCoord.x + u_offset, 1.0), v_texCoord.y);
+          vec4 currentPixel = texture2D(u_texture, shiftedTexCoord);
+          float scanY = u_scanLine;
+          if (v_texCoord.y > scanY) {
+            gl_FragColor = currentPixel;
+          } else {
+            vec2 copiedTexCoord = vec2(mod(v_texCoord.x + u_offset, 1.0), scanY);
+            gl_FragColor = texture2D(u_texture, copiedTexCoord);
+          }
+        }
+      `;
+      let vertexShader = createShader(gl, gl.VERTEX_SHADER, vertexShaderSource);
+      let fragmentShader = createShader(gl, gl.FRAGMENT_SHADER, fragmentShaderSource);
+      this.shaderProgram = createProgram(gl, vertexShader, fragmentShader);
+      gl.useProgram(this.shaderProgram);
+      setupBuffers(gl, this.shaderProgram);
+      // Create and configure texture.
+      this.texture = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, this.texture);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      this.updateTransform();
+    };
+
+    // Adjust canvas pixel dimensions to match its displayed size.
+    CanvasInstance.prototype.updateCanvasSize = function() {
+      this.canvas.width = this.canvas.clientWidth;
+      this.canvas.height = this.canvas.clientHeight;
+      this.gl.viewport(0, 0, this.canvas.width, this.canvas.height);
+    };
+
+    // Update the transformation matrix so that the image is drawn in "cover" mode.
+    // It preserves the image’s aspect ratio and scales it to completely fill the canvas cell.
+    CanvasInstance.prototype.updateTransform = function() {
+      const gl = this.gl;
+      const transformLoc = gl.getUniformLocation(this.shaderProgram, "u_transform");
+      let cw = this.canvas.width;
+      let ch = this.canvas.height;
+      // Compute scale factor to "cover" the cell.
+      let factor = Math.max(cw / state.imageWidth, ch / state.imageHeight);
+      let drawWidth = state.imageWidth * factor;
+      let drawHeight = state.imageHeight * factor;
+      let offsetX = (cw - drawWidth) / 2;
+      let offsetY = (ch - drawHeight) / 2;
+      // In clip space, scale factors are relative to the canvas size.
+      let scaleX = drawWidth / cw;
+      let scaleY = drawHeight / ch;
+      // Compute translation in clip space (range: -1 to 1).
+      let tx = 2 * offsetX / cw;
+      let ty = 2 * offsetY / ch;
+      // Column-major 4x4 transformation matrix.
+      let m = new Float32Array([
+        scaleX, 0,      0, 0,
+        0,      scaleY, 0, 0,
+        0,      0,      1, 0,
+        tx,     ty,     0, 1
+      ]);
+      gl.uniformMatrix4fv(transformLoc, false, m);
+    };
+
+    CanvasInstance.prototype.updateUniforms = function() {
+      const gl = this.gl;
+      let scanLoc = gl.getUniformLocation(this.shaderProgram, "u_scanLine");
+      let normalizedScanRow = (state.imageHeight > 0) ? (state.scannerRow / state.imageHeight) : 0.63;
+      gl.uniform1f(scanLoc, normalizedScanRow);
+      let offsetLoc = gl.getUniformLocation(this.shaderProgram, "u_offset");
+      gl.uniform1f(offsetLoc, state.offset);
+      this.updateTransform();
+    };
+
+    CanvasInstance.prototype.drawScene = function() {
+      const gl = this.gl;
+      gl.clear(gl.COLOR_BUFFER_BIT);
+      gl.viewport(0, 0, this.canvas.width, this.canvas.height);
+      gl.drawArrays(gl.TRIANGLES, 0, 6);
+    };
+
+    CanvasInstance.prototype.loadTextureFromImage = function(img) {
+      const gl = this.gl;
+      gl.bindTexture(gl.TEXTURE_2D, this.texture);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
+      if (isPowerOf2(img.width) && isPowerOf2(img.height)) {
+        gl.generateMipmap(gl.TEXTURE_2D);
+      } else {
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+      }
+      this.drawScene();
+    };
+
+    // ----- Utility WebGL Functions -----
+    function createShader(gl, type, source) {
+      const shader = gl.createShader(type);
+      gl.shaderSource(shader, source);
+      gl.compileShader(shader);
+      if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+        console.error("Shader compilation failed:", gl.getShaderInfoLog(shader));
+        gl.deleteShader(shader);
+        return null;
+      }
+      return shader;
+    }
+    function createProgram(gl, vertexShader, fragmentShader) {
+      const program = gl.createProgram();
+      gl.attachShader(program, vertexShader);
+      gl.attachShader(program, fragmentShader);
+      gl.linkProgram(program);
+      if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+        console.error("Program linking failed:", gl.getProgramInfoLog(program));
+        return null;
+      }
+      return program;
+    }
+    function setupBuffers(gl, shaderProgram) {
+      // A full-screen quad in clip space (covers [-1, 1] in both axes).
+      const positionBuffer = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+      gl.bufferData(
+        gl.ARRAY_BUFFER,
+        new Float32Array([
+          -1, -1,  1, -1,  -1,  1,
+          -1,  1,  1, -1,   1,  1,
+        ]),
+        gl.STATIC_DRAW
+      );
+      const posLoc = gl.getAttribLocation(shaderProgram, "a_position");
+      gl.enableVertexAttribArray(posLoc);
+      gl.vertexAttribPointer(posLoc, 2, gl.FLOAT, false, 0, 0);
+
+      const texCoordBuffer = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, texCoordBuffer);
+      gl.bufferData(
+        gl.ARRAY_BUFFER,
+        new Float32Array([
+          0, 1,   1, 1,   0, 0,
+          0, 0,   1, 1,   1, 0,
+        ]),
+        gl.STATIC_DRAW
+      );
+      const texLoc = gl.getAttribLocation(shaderProgram, "a_texCoord");
+      gl.enableVertexAttribArray(texLoc);
+      gl.vertexAttribPointer(texLoc, 2, gl.FLOAT, false, 0, 0);
+    }
+    function isPowerOf2(value) {
+      return (value & (value - 1)) === 0;
+    }
+
+    // ----- Create Canvas Instances in a 2x3 grid -----
+    function createCanvasInstances() {
+      const container = document.getElementById("canvasContainer");
+      container.innerHTML = "";
+      canvasInstances = [];
+      const columns = 2;
+      const rows = 3; // Always a 2 x 3 grid
+      container.style.gridTemplateColumns = `repeat(${columns}, 1fr)`;
+      // Each row’s height is set so that the canvas cell is as wide as it is tall.
+      container.style.gridTemplateRows = `repeat(${rows}, calc(100vw / 2))`;
+      const total = columns * rows;
+      for (let i = 0; i < total; i++) {
+        const canvas = document.createElement("canvas");
+        canvas.style.width = "100%";
+        canvas.style.height = "100%";
+        container.appendChild(canvas);
+        canvasInstances.push(new CanvasInstance(canvas));
+      }
+    }
+
+    // ----- Window Resize Handler -----
+    function onWindowResize() {
+      canvasInstances.forEach(inst => {
+        inst.updateCanvasSize();
+        inst.updateTransform();
+        inst.drawScene();
+      });
+    }
+    window.addEventListener("resize", onWindowResize);
+
+    // ----- Image Loading & Global Updates -----
+    async function fetchImages() {
+      const response = await fetch("http://localhost:3001/list-images");
+      imageList = await response.json();
+      if (config.randomOrder) {
+        shuffleArray(imageList);
+      }
+      loadNextImage();
+      startAutoTimer();
+      setInterval(updateGlobalEffect, 16);
+    }
+    function loadNextImage() {
+      if (imageList.length === 0) return;
+      loadTexture(`http://localhost:3001/images/${imageList[currentIndex]}`);
+    }
+    function loadTexture(imageUrl) {
+      const img = new Image();
+      img.crossOrigin = "anonymous";
+      img.onload = function () {
+        let normalized = (state.imageHeight > 0)
+          ? (state.scannerRow / state.imageHeight)
+          : 0.63;
+        state.imageWidth = img.width;
+        state.imageHeight = img.height;
+        state.scannerRow = Math.floor(normalized * state.imageHeight);
+        canvasInstances.forEach(inst => {
+          inst.updateTransform();
+          inst.loadTextureFromImage(img);
+        });
+      };
+      img.src = imageUrl;
+    }
+    function startAutoTimer() {
+      clearTimeout(autoTimer);
+      autoTimer = setTimeout(() => {
+        currentIndex = (currentIndex + 1) % imageList.length;
+        loadNextImage();
+        startAutoTimer();
+      }, 59000);
+    }
+    function updateGlobalEffect() {
+      if (canvasInstances.length > 0) {
+        let inst = canvasInstances[0];
+        let gl = inst.gl;
+        if (state.scannerRow > 0 && state.scannerRow < state.imageHeight) {
+          let rowCurrent = new Uint8Array(inst.canvas.width * 4);
+          let rowPrevious = new Uint8Array(inst.canvas.width * 4);
+          gl.readPixels(
+            0,
+            Math.floor(state.scannerRow),
+            inst.canvas.width,
+            1,
+            gl.RGBA,
+            gl.UNSIGNED_BYTE,
+            rowCurrent
+          );
+          gl.readPixels(
+            0,
+            Math.floor(state.scannerRow) - 1,
+            inst.canvas.width,
+            1,
+            gl.RGBA,
+            gl.UNSIGNED_BYTE,
+            rowPrevious
+          );
+          let unchanged = true;
+          for (let i = 0; i < rowCurrent.length; i++) {
+            if (rowCurrent[i] !== rowPrevious[i]) {
+              unchanged = false;
+              break;
+            }
+          }
+          if (unchanged) {
+            state.unchangedCount++;
+          } else {
+            state.unchangedCount = 0;
+          }
+        }
+        if (state.unchangedCount >= 3) {
+          state.scannerRow += 1;
+          state.unchangedCount = 0;
+        } else {
+          state.scannerRow += state.scanSpeed;
+        }
+        if (state.scannerRow >= state.imageHeight) {
+          state.scannerRow = Math.floor(state.imageHeight * 0.63);
+        }
+        if (state.scrollActive) {
+          state.offset += state.scrollSpeed;
+          if (state.offset >= 1.0) {
+            state.offset -= 1.0;
+          }
+        }
+      }
+      canvasInstances.forEach(inst => {
+        inst.updateUniforms();
+        inst.drawScene();
+      });
+    }
+    function shuffleArray(array) {
+      for (let i = array.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [array[i], array[j]] = [array[j], array[i]];
+      }
+    }
+
+    // ----- Global Key Controls -----
+    window.addEventListener("keydown", function (e) {
+      switch (e.code) {
+        case "ArrowLeft":
+          e.preventDefault();
+          if (e.shiftKey) {
+            currentIndex = Math.max(0, currentIndex - 100);
+          } else {
+            currentIndex = (currentIndex - 1 + imageList.length) % imageList.length;
+          }
+          loadNextImage();
+          startAutoTimer();
+          break;
+        case "ArrowRight":
+          e.preventDefault();
+          if (e.shiftKey) {
+            currentIndex = Math.min(imageList.length - 1, currentIndex + 100);
+          } else {
+            currentIndex = (currentIndex + 1) % imageList.length;
+          }
+          loadNextImage();
+          startAutoTimer();
+          break;
+        case "Space":
+          e.preventDefault();
+          state.scrollActive = !state.scrollActive;
+          break;
+        case "KeyQ":
+          state.scanSpeed = Math.max(0.2, state.scanSpeed - 0.2);
+          break;
+        case "KeyW":
+          state.scanSpeed += 0.2;
+          break;
+        case "KeyA":
+          state.scrollSpeed = Math.max(0.0005, state.scrollSpeed - 0.0005);
+          break;
+        case "KeyS":
+          state.scrollSpeed += 0.0005;
+          break;
+        case "KeyZ":
+          state.scannerRow = state.imageHeight;
+          break;
+      }
+    });
+
+    // ----- Initialize Everything -----
+    window.onload = function () {
+      createCanvasInstances();
+      fetchImages();
+    };
+  </script>
+</body>
+</html>
