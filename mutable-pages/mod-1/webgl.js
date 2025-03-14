@@ -311,13 +311,13 @@ export function setupWebGL() {
     // Channel 1: Perlin noise glitch intensity (unchanged)
     if (channel === 1) glitchIntensity = normalized * 10.0;
     // Channel 2: Original dispersion effect
-    if (channel === 2) dispersion = normalized * 5.5;
+    if (channel === 2) dispersion = normalized * 2.5;
     // Channel 3: Invert effect
     if (channel === 3) invert = normalized;
     // Channel 4: Horizontal glitch effect
     if (channel === 4) horizontalGlitch = normalized * 50.0;
     // Channel 5: New 3D dispersion effect
-    if (channel === 5) dispersion3D = normalized * 5.5;
+    if (channel === 5) dispersion3D = normalized * 2.5;
     // Channel 6: Scroll speed (unchanged)
     if (channel === 6) scrollSpeed = normalized * 0.5;
     // Channel 7: Rotation angle (unchanged)
