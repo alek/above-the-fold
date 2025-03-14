@@ -58,7 +58,6 @@ export function setupWebGL() {
       .then(response => response.json())
       .then(data => {
         bgImageUrls = data;
-        // console.log("Fetched image list:", bgImageUrls);
         // Load the first image immediately
         displayBackgroundImage();
         // Set up auto-advance
@@ -172,7 +171,7 @@ export function setupWebGL() {
       );
       vec2 uvOriginal = rotatedUV + dispersionOffset * u_dispersion;
 
-      // --- New 3D Dispersion Effect (Channel 5) ---
+      // --- New 3D Dispersion Effect (Channel 5) modified for Black & White ---
       vec4 colorSample = texture2D(u_bgTexture, rotatedUV);
       vec2 key = vec2(floor(colorSample.r * 10.0), floor(colorSample.g * 10.0));
       vec2 baseDispersion = vec2(
@@ -181,13 +180,10 @@ export function setupWebGL() {
       );
       vec2 centeredUV = rotatedUV - 0.5;
       float depthFactor = 1.0 + length(centeredUV);
-      vec2 redOffset = baseDispersion * u_dispersion3D * 0.8 * depthFactor;
-      vec2 greenOffset = baseDispersion * u_dispersion3D * 1.0 * depthFactor;
-      vec2 blueOffset = baseDispersion * u_dispersion3D * 1.2 * depthFactor;
-      float r = texture2D(u_bgTexture, mod(rotatedUV + redOffset, 1.0)).r;
-      float g = texture2D(u_bgTexture, mod(rotatedUV + greenOffset, 1.0)).g;
-      float b = texture2D(u_bgTexture, mod(rotatedUV + blueOffset, 1.0)).b;
-      vec4 disp3dColor = vec4(r, g, b, colorSample.a);
+      vec2 offset = baseDispersion * u_dispersion3D * depthFactor;
+      vec4 sampleColor = texture2D(u_bgTexture, mod(rotatedUV + offset, 1.0));
+      float gray = dot(sampleColor.rgb, vec3(0.299, 0.587, 0.114));
+      vec4 disp3dColor = vec4(vec3(gray), sampleColor.a);
 
       // Blend the original and 3D dispersion effects based on u_dispersion3D
       vec4 finalDispersion = mix(texture2D(u_bgTexture, mod(uvOriginal, 1.0)), disp3dColor, clamp(u_dispersion3D, 0.0, 1.0));
