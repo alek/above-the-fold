@@ -45,6 +45,11 @@
     let horizontalGlitch = 0.0; // Channel 5: controls horizontal glitch.
     let glitchAmount = 0.0;     // Channel 7: overall glitch factor.
     
+    // --- Vertical Scrolling Mode ---
+    let verticalModeActive = false;  // toggled with "X"
+    let verticalOffset = 0.0;          // vertical offset (normalized 0.0 to 1.0)
+    let verticalScrollSpeed = 0.0005;  // speed for vertical scrolling (now adjustable via MIDI channel 6)
+    
     // Transformation matrix for centering.
     let transformMatrix = new Float32Array(16);
     const config = { randomOrder: false };
@@ -101,6 +106,7 @@
         console.error("WebGL not supported");
         return;
       }
+      // Vertex Shader
       const vertexShaderSource = `
         attribute vec4 a_position;
         attribute vec2 a_texCoord;
@@ -112,13 +118,13 @@
         }
       `;
       /* 
-         Fragment shader with updated distortion and horizontal glitch effects:
-         - u_scanLine: normalized source row for scanning.
-         - u_scanThreshold: normalized threshold for scan effect.
-         - u_time: current time in seconds for noise.
-         - u_horizontalGlitch: controls horizontal glitch (Channel 5).
-         - u_distortion: controls distortion effect (Channel 3).
-         In the scanned region (v_texCoord.y < u_scanThreshold), both effects use similar noise functions.
+         Fragment shader:
+         - Uses u_scanLine, u_scanThreshold for scan effect.
+         - u_offset, u_distortion, u_invert, u_glitch, u_time, u_horizontalGlitch for glitch effects.
+         - NEW UNIFORM:
+             u_verticalMode: 1.0 if vertical mode is active, 0.0 otherwise.
+             u_vOffset: vertical offset to add to texture coordinate (wraps via mod).
+         - When vertical mode is active, the texture coordinate's y component is shifted down.
       */
       const fragmentShaderSource = `
         precision mediump float;
@@ -132,19 +138,31 @@
         uniform float u_glitch;
         uniform float u_time;
         uniform float u_horizontalGlitch;
+        // New uniform for vertical scrolling mode:
+        uniform float u_verticalMode;
+        uniform float u_vOffset;
+        
         float rand(vec2 co) {
           return fract(sin(dot(co.xy, vec2(12.9898,78.233))) * 43758.5453);
         }
+        
         void main(){
-          float glitchVal = rand(v_texCoord * 100.0) * u_glitch;
+          // Determine texture coordinate to use.
+          vec2 texCoord = v_texCoord;
+          if(u_verticalMode > 0.5) {
+            // Shift the texture coordinate down, wrapping around
+            texCoord.y = mod(texCoord.y + u_vOffset, 1.0);
+          }
+          
+          float glitchVal = rand(texCoord * 100.0) * u_glitch;
           // Compute horizontal glitch offset (Channel 5)
-          float hGlitch = rand(vec2(v_texCoord.y * 100.0, u_time * 5.0)) * u_horizontalGlitch * 0.05;
-          vec2 shiftedTexCoord = vec2(mod(v_texCoord.x + u_offset + glitchVal + hGlitch, 1.0), v_texCoord.y);
+          float hGlitch = rand(vec2(texCoord.y * 100.0, u_time * 5.0)) * u_horizontalGlitch * 0.05;
+          vec2 shiftedTexCoord = vec2(mod(texCoord.x + u_offset + glitchVal + hGlitch, 1.0), texCoord.y);
           vec4 originalPixel = texture2D(u_texture, shiftedTexCoord);
-          if(v_texCoord.y < u_scanThreshold) {
-            // Compute distortion glitch offset (Channel 3) with similar logic as horizontal glitch.
-            float dGlitch = rand(vec2(v_texCoord.y * 100.0, u_time * 5.0)) * u_distortion * 0.05;
-            vec2 copyCoord = vec2(mod(v_texCoord.x + u_offset + dGlitch, 1.0), u_scanLine);
+          if(texCoord.y < u_scanThreshold) {
+            // Compute distortion glitch offset (Channel 3)
+            float dGlitch = rand(vec2(texCoord.y * 100.0, u_time * 5.0)) * u_distortion * 0.05;
+            vec2 copyCoord = vec2(mod(texCoord.x + u_offset + dGlitch, 1.0), u_scanLine);
             vec4 copiedPixel = texture2D(u_texture, copyCoord);
             float invFactor = u_invert / 255.0;
             gl_FragColor = mix(copiedPixel, vec4(1.0 - copiedPixel.rgb, copiedPixel.a), invFactor);
@@ -225,7 +243,6 @@
         imageWidth = img.width;
         imageHeight = img.height;
         baseScanBegin = imageHeight * 0.5;
-        baseScanEnd = baseScanBegin;
         scanOffset = 0;
         updateTransform();
         gl.bindTexture(gl.TEXTURE_2D, texture);
@@ -264,6 +281,13 @@
       gl.uniform1f(gl.getUniformLocation(shaderProgram, "u_glitch"), glitchAmount);
       gl.uniform1f(gl.getUniformLocation(shaderProgram, "u_horizontalGlitch"), horizontalGlitch);
       gl.uniform1f(gl.getUniformLocation(shaderProgram, "u_time"), performance.now() / 1000.0);
+      
+      // --- Vertical Mode Updates ---
+      gl.uniform1f(gl.getUniformLocation(shaderProgram, "u_verticalMode"), verticalModeActive ? 1.0 : 0.0);
+      if (verticalModeActive) {
+        verticalOffset = (verticalOffset - verticalScrollSpeed) % 1.0;
+      }
+      gl.uniform1f(gl.getUniformLocation(shaderProgram, "u_vOffset"), verticalOffset);
       
       drawScene();
     }
@@ -336,6 +360,12 @@
         case "KeyZ":
           scanOffset = 0;
           break;
+        case "KeyX":
+          // Toggle vertical scrolling mode (shift down effect)
+          e.preventDefault();
+          verticalModeActive = !verticalModeActive;
+          console.log("Vertical mode", verticalModeActive ? "activated" : "deactivated");
+          break;
       }
     });
     
@@ -360,13 +390,12 @@
             if(imageHeight) { baseScanBegin = normalized * imageHeight; }
             break;
           case 1:
-            if(imageHeight) { baseScanEnd = normalized * imageHeight; }
+            // Unused in this example; could control scan end.
             break;
           case 2:
             scanSpeed = 1 + normalized * 9;
             break;
           case 3:
-            // Channel 3 now uses the same noise logic for distortion as channel 5.
             distortionAmount = normalized;
             break;
           case 4:
@@ -376,21 +405,11 @@
             horizontalGlitch = normalized;
             break;
           case 6:
-            // Map the raw pitch to an offset so that:
-            // - The lowest MIDI value (-8192) gives an offset of 0.
-            // - The highest MIDI value (8064) gives an offset of -128.
-            // Compute: offset = - (1/127) * (pitch + 8192)
-            let rawOffset = (1/127) * (pitch + 8192);
-            let offsetIndex = Math.floor(rawOffset);
-            // let targetIndex = (currentIndex + offsetIndex) % imageList.length;
-            let targetIndex = offsetIndex % imageList.length;
-            if (targetIndex < 0) {
-              targetIndex = targetIndex + imageList.length;
-            }
-            if (targetIndex !== currentIndex) {
-              currentIndex = targetIndex;
-              loadNextImage();
-            }
+            // Channel 6 now controls the vertical scrolling speed.
+            // Map pitch value to a normalized range (0 to 1) then set verticalScrollSpeed.
+            let normalizedSpeed = (pitch + 8192) / 16383;
+            // Adjust the multiplier (0.01) as needed for a comfortable scroll speed range.
+            verticalScrollSpeed = normalizedSpeed * 0.01;
             break;
           case 7:
             glitchAmount = normalized * 1.1;
